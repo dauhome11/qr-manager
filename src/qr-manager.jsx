@@ -1,9 +1,27 @@
 import React, { useState, useEffect, useRef } from 'react';
 import QRCode from 'qrcode.react';
-import { Plus, Edit2, Trash2, Download, Copy, Check, AlertCircle } from 'lucide-react';
+import { Plus, Edit2, Trash2, Download, Copy, Check, AlertCircle, RefreshCw } from 'lucide-react';
+
+// 👉 Dán URL Web App từ Google Apps Script vào đây sau khi deploy
+const SHEET_SYNC_URL = 'https://script.google.com/macros/s/AKfycby0uLLKDzzn3ydjs2irNupIlgiLPFCzHt-qr2Bctmn5hlJhYEd0OA39ZSpJe0Mb5FDU/exec';
+
+async function syncToSheet(action, payload) {
+  if (!SHEET_SYNC_URL || SHEET_SYNC_URL.includes('PASTE_YOUR')) return;
+  try {
+    await fetch(SHEET_SYNC_URL, {
+      method: 'POST',
+      mode: 'no-cors', // Apps Script không hỗ trợ CORS response, dùng no-cors để gửi được request
+      headers: { 'Content-Type': 'text/plain' },
+      body: JSON.stringify({ action, ...payload })
+    });
+  } catch (err) {
+    console.error('Sync to Google Sheet failed:', err);
+  }
+}
 
 export default function QRManager() {
   const [qrList, setQrList] = useState([]);
+  const [syncStatus, setSyncStatus] = useState('idle'); // idle | syncing | synced
   const [formData, setFormData] = useState({
     name: '',
     url: '',
@@ -74,19 +92,18 @@ export default function QRManager() {
     }
 
     if (editingId) {
-      setQrList(qrList.map(item =>
-        item.id === editingId
-          ? {
-              ...item,
-              name: formData.name,
-              url: formData.url,
-              description: formData.description,
-              logoPreview: formData.logoPreview || item.logoPreview,
-              updatedAt: new Date().toISOString()
-            }
-          : item
-      ));
+      const updatedQR = {
+        ...qrList.find(item => item.id === editingId),
+        name: formData.name,
+        url: formData.url,
+        description: formData.description,
+        logoPreview: formData.logoPreview || qrList.find(item => item.id === editingId)?.logoPreview,
+        updatedAt: new Date().toISOString()
+      };
+      setQrList(qrList.map(item => item.id === editingId ? updatedQR : item));
       setEditingId(null);
+      setSyncStatus('syncing');
+      syncToSheet('update', { qr: updatedQR }).finally(() => setSyncStatus('synced'));
     } else {
       const newQR = {
         id: Date.now(),
@@ -97,6 +114,8 @@ export default function QRManager() {
         createdAt: new Date().toISOString()
       };
       setQrList([newQR, ...qrList]);
+      setSyncStatus('syncing');
+      syncToSheet('create', { qr: newQR }).finally(() => setSyncStatus('synced'));
     }
 
     setFormData({
@@ -123,7 +142,14 @@ export default function QRManager() {
   const handleDelete = (id) => {
     if (confirm('Xác nhận xóa QR code này?')) {
       setQrList(qrList.filter(item => item.id !== id));
+      setSyncStatus('syncing');
+      syncToSheet('delete', { id }).finally(() => setSyncStatus('synced'));
     }
+  };
+
+  const handleManualSync = () => {
+    setSyncStatus('syncing');
+    syncToSheet('sync_all', { qrList }).finally(() => setSyncStatus('synced'));
   };
 
   const handleDownload = (qrId) => {
@@ -160,9 +186,24 @@ export default function QRManager() {
     <div className="min-h-screen bg-gradient-to-br from-slate-50 to-slate-100">
       {/* Header */}
       <div className="bg-white border-b border-slate-200">
-        <div className="max-w-6xl mx-auto px-4 py-8">
-          <h1 className="text-3xl font-bold text-slate-900">QR Code Manager</h1>
-          <p className="text-slate-600 mt-2">Tạo, quản lý và tùy chỉnh QR code cho marketing, thanh toán & social</p>
+        <div className="max-w-6xl mx-auto px-4 py-8 flex items-start justify-between">
+          <div>
+            <h1 className="text-3xl font-bold text-slate-900">QR Code Manager</h1>
+            <p className="text-slate-600 mt-2">Tạo, quản lý và tùy chỉnh QR code cho marketing, thanh toán & social</p>
+          </div>
+          <div className="flex flex-col items-end gap-2">
+            <button
+              onClick={handleManualSync}
+              disabled={syncStatus === 'syncing'}
+              className="flex items-center gap-2 px-4 py-2 text-sm font-medium text-slate-600 border border-slate-200 rounded-lg hover:bg-slate-50 transition disabled:opacity-50"
+            >
+              <RefreshCw className={`w-4 h-4 ${syncStatus === 'syncing' ? 'animate-spin' : ''}`} />
+              Đồng bộ Sheet
+            </button>
+            {syncStatus === 'synced' && (
+              <span className="text-xs text-green-600">✓ Đã đồng bộ</span>
+            )}
+          </div>
         </div>
       </div>
 
@@ -382,22 +423,6 @@ export default function QRManager() {
         )}
       </div>
 
-      {/* Footer with Setup Instructions */}
-      <div className="bg-slate-900 text-white mt-16">
-        <div className="max-w-6xl mx-auto px-4 py-12">
-          <h3 className="text-lg font-semibold mb-4">📌 Hướng dẫn lưu vào Google Sheets</h3>
-          <div className="space-y-3 text-sm text-slate-300">
-            <p>✅ <strong>Hiện tại:</strong> Dữ liệu lưu trong trình duyệt (localStorage)</p>
-            <p>✅ <strong>Để backup vào Google Sheets:</strong></p>
-            <ol className="list-decimal list-inside space-y-2 ml-2">
-              <li>Bấm F12 → Console tab</li>
-              <li>Paste: <code className="bg-slate-800 px-2 py-1 rounded">console.log(JSON.stringify(JSON.parse(localStorage.getItem('qrData')), null, 2))</code></li>
-              <li>Copy kết quả → Paste vào Google Sheet</li>
-              <li>Hoặc liên hệ để setup API tự động</li>
-            </ol>
-          </div>
-        </div>
-      </div>
     </div>
   );
 }
