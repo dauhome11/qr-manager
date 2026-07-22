@@ -336,16 +336,17 @@ export default function QRManager() {
                     <div className="flex justify-center">
                       <QRCode
                         value={qr.url}
-                        size={200}
+                        size={800}
                         level="H"
                         includeMargin={true}
+                        style={{ width: '200px', height: '200px' }}
                         imageSettings={
                           qr.logoPreview ? {
                             src: qr.logoPreview,
                             x: undefined,
                             y: undefined,
-                            height: 40,
-                            width: 40,
+                            height: 160,
+                            width: 160,
                             excavate: true
                           } : undefined
                         }
