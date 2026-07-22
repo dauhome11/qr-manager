@@ -3,7 +3,7 @@ import QRCode from 'qrcode.react';
 import { Plus, Edit2, Trash2, Download, Copy, Check, AlertCircle, RefreshCw } from 'lucide-react';
 
 // 👉 Dán URL Web App từ Google Apps Script vào đây sau khi deploy
-const SHEET_SYNC_URL = 'https://script.google.com/macros/s/AKfycbyfs9V7u6mZPu0Acuef43HAjyt8VuwCnrIiP8z-P46qkzHWPZ2DCEascT7kld-fVY0/exec';
+const SHEET_SYNC_URL = 'https://script.google.com/macros/s/AKfycbyUdG3hcP_uPAASMqjwWp_0CdSPOXK6Pj9L3-T6xJZXmD5ocaq31WvZ9TpueEURx0UR/exec';
 
 async function syncToSheet(action, payload) {
   if (!SHEET_SYNC_URL || SHEET_SYNC_URL.includes('PASTE_YOUR')) return;
