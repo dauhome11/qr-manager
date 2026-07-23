@@ -1,27 +1,14 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import QRCode from 'qrcode.react';
-import { Plus, Edit2, Trash2, Download, Copy, Check, AlertCircle, RefreshCw } from 'lucide-react';
+import { Plus, Edit2, Trash2, Download, Copy, Check, AlertCircle, RefreshCw, Wifi, WifiOff } from 'lucide-react';
+import { supabase, isSupabaseConfigured } from './supabaseClient';
 
-// 👉 Dán URL Web App từ Google Apps Script vào đây sau khi deploy
-const SHEET_SYNC_URL = 'https://script.google.com/macros/s/AKfycbyUdG3hcP_uPAASMqjwWp_0CdSPOXK6Pj9L3-T6xJZXmD5ocaq31WvZ9TpueEURx0UR/exec';
-
-async function syncToSheet(action, payload) {
-  if (!SHEET_SYNC_URL || SHEET_SYNC_URL.includes('PASTE_YOUR')) return;
-  try {
-    await fetch(SHEET_SYNC_URL, {
-      method: 'POST',
-      mode: 'no-cors', // Apps Script không hỗ trợ CORS response, dùng no-cors để gửi được request
-      headers: { 'Content-Type': 'text/plain' },
-      body: JSON.stringify({ action, ...payload })
-    });
-  } catch (err) {
-    console.error('Sync to Google Sheet failed:', err);
-  }
-}
+const TABLE = 'qr_codes';
 
 export default function QRManager() {
   const [qrList, setQrList] = useState([]);
-  const [syncStatus, setSyncStatus] = useState('idle'); // idle | syncing | synced
+  const [loading, setLoading] = useState(true);
+  const [connectionStatus, setConnectionStatus] = useState('connecting'); // connecting | online | offline | not_configured
   const [formData, setFormData] = useState({
     name: '',
     url: '',
@@ -35,18 +22,87 @@ export default function QRManager() {
   const fileInputRef = useRef();
   const qrRefs = useRef({});
 
-  // Load from localStorage on mount
-  useEffect(() => {
-    const saved = localStorage.getItem('qrData');
-    if (saved) {
-      setQrList(JSON.parse(saved));
-    }
+  // Map row từ Supabase -> shape dùng trong UI
+  const mapRow = (row) => ({
+    id: row.id,
+    name: row.name,
+    url: row.url,
+    description: row.description || '',
+    logoPreview: row.logo_data || null,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at
+  });
+
+  const fetchAll = useCallback(async () => {
+    const { data, error: fetchError } = await supabase
+      .from(TABLE)
+      .select('*')
+      .order('created_at', { ascending: false });
+    if (fetchError) throw fetchError;
+    return (data || []).map(mapRow);
   }, []);
 
-  // Save to localStorage whenever qrList changes
+  // Load lần đầu + set up realtime subscription
   useEffect(() => {
-    localStorage.setItem('qrData', JSON.stringify(qrList));
-  }, [qrList]);
+    if (!isSupabaseConfigured) {
+      setConnectionStatus('not_configured');
+      setLoading(false);
+      return;
+    }
+
+    let isMounted = true;
+
+    (async () => {
+      try {
+        const rows = await fetchAll();
+        if (isMounted) {
+          setQrList(rows);
+          setConnectionStatus('online');
+        }
+      } catch (err) {
+        console.error('Không tải được dữ liệu từ Supabase:', err);
+        if (isMounted) {
+          setError('Không kết nối được Supabase. Kiểm tra lại VITE_SUPABASE_URL / VITE_SUPABASE_ANON_KEY.');
+          setConnectionStatus('offline');
+        }
+      } finally {
+        if (isMounted) setLoading(false);
+      }
+    })();
+
+    const channel = supabase
+      .channel('qr_codes_changes')
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: TABLE },
+        (payload) => {
+          setQrList((prev) => {
+            if (payload.eventType === 'INSERT') {
+              const incoming = mapRow(payload.new);
+              if (prev.some((item) => item.id === incoming.id)) return prev;
+              return [incoming, ...prev];
+            }
+            if (payload.eventType === 'UPDATE') {
+              const updated = mapRow(payload.new);
+              return prev.map((item) => (item.id === updated.id ? updated : item));
+            }
+            if (payload.eventType === 'DELETE') {
+              return prev.filter((item) => item.id !== payload.old.id);
+            }
+            return prev;
+          });
+        }
+      )
+      .subscribe((status) => {
+        if (status === 'SUBSCRIBED') setConnectionStatus('online');
+        if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') setConnectionStatus('offline');
+      });
+
+    return () => {
+      isMounted = false;
+      supabase.removeChannel(channel);
+    };
+  }, [fetchAll]);
 
   const isValidUrl = (string) => {
     try {
@@ -72,7 +128,7 @@ export default function QRManager() {
     }
   };
 
-  const handleSubmit = (e) => {
+  const handleSubmit = async (e) => {
     e.preventDefault();
     setError('');
 
@@ -80,51 +136,58 @@ export default function QRManager() {
       setError('Vui lòng nhập tên QR code');
       return;
     }
-
     if (!formData.url.trim()) {
       setError('Vui lòng nhập URL');
       return;
     }
-
     if (!isValidUrl(formData.url)) {
       setError('URL không hợp lệ. Ví dụ: https://example.com');
       return;
     }
-
-    if (editingId) {
-      const updatedQR = {
-        ...qrList.find(item => item.id === editingId),
-        name: formData.name,
-        url: formData.url,
-        description: formData.description,
-        logoPreview: formData.logoPreview || qrList.find(item => item.id === editingId)?.logoPreview,
-        updatedAt: new Date().toISOString()
-      };
-      setQrList(qrList.map(item => item.id === editingId ? updatedQR : item));
-      setEditingId(null);
-      setSyncStatus('syncing');
-      syncToSheet('update', { qr: updatedQR }).finally(() => setSyncStatus('synced'));
-    } else {
-      const newQR = {
-        id: Date.now(),
-        name: formData.name,
-        url: formData.url,
-        description: formData.description,
-        logoPreview: formData.logoPreview,
-        createdAt: new Date().toISOString()
-      };
-      setQrList([newQR, ...qrList]);
-      setSyncStatus('syncing');
-      syncToSheet('create', { qr: newQR }).finally(() => setSyncStatus('synced'));
+    if (!isSupabaseConfigured) {
+      setError('Chưa cấu hình Supabase. Xem README.md để kết nối trước khi lưu dữ liệu.');
+      return;
     }
 
-    setFormData({
-      name: '',
-      url: '',
-      description: '',
-      logoFile: null,
-      logoPreview: null
-    });
+    try {
+      if (editingId) {
+        const current = qrList.find((item) => item.id === editingId);
+        const { data, error: updateError } = await supabase
+          .from(TABLE)
+          .update({
+            name: formData.name,
+            url: formData.url,
+            description: formData.description,
+            logo_data: formData.logoPreview ?? current?.logoPreview ?? null
+          })
+          .eq('id', editingId)
+          .select()
+          .single();
+        if (updateError) throw updateError;
+        const updated = mapRow(data);
+        setQrList((prev) => prev.map((item) => (item.id === updated.id ? updated : item)));
+        setEditingId(null);
+      } else {
+        const { data, error: insertError } = await supabase
+          .from(TABLE)
+          .insert({
+            name: formData.name,
+            url: formData.url,
+            description: formData.description,
+            logo_data: formData.logoPreview || null
+          })
+          .select()
+          .single();
+        if (insertError) throw insertError;
+        const created = mapRow(data);
+        setQrList((prev) => (prev.some((item) => item.id === created.id) ? prev : [created, ...prev]));
+      }
+
+      setFormData({ name: '', url: '', description: '', logoFile: null, logoPreview: null });
+    } catch (err) {
+      console.error('Lưu QR code thất bại:', err);
+      setError('Lưu thất bại: ' + (err.message || 'lỗi không xác định'));
+    }
   };
 
   const handleEdit = (qr) => {
@@ -139,17 +202,28 @@ export default function QRManager() {
     window.scrollTo({ top: 0, behavior: 'smooth' });
   };
 
-  const handleDelete = (id) => {
-    if (confirm('Xác nhận xóa QR code này?')) {
-      setQrList(qrList.filter(item => item.id !== id));
-      setSyncStatus('syncing');
-      syncToSheet('delete', { id }).finally(() => setSyncStatus('synced'));
+  const handleDelete = async (id) => {
+    if (!confirm('Xác nhận xóa QR code này?')) return;
+    try {
+      const { error: deleteError } = await supabase.from(TABLE).delete().eq('id', id);
+      if (deleteError) throw deleteError;
+      setQrList((prev) => prev.filter((item) => item.id !== id));
+    } catch (err) {
+      console.error('Xóa QR code thất bại:', err);
+      setError('Xóa thất bại: ' + (err.message || 'lỗi không xác định'));
     }
   };
 
-  const handleManualSync = () => {
-    setSyncStatus('syncing');
-    syncToSheet('sync_all', { qrList }).finally(() => setSyncStatus('synced'));
+  const handleRefresh = async () => {
+    setConnectionStatus('connecting');
+    try {
+      const rows = await fetchAll();
+      setQrList(rows);
+      setConnectionStatus('online');
+    } catch (err) {
+      console.error('Làm mới thất bại:', err);
+      setConnectionStatus('offline');
+    }
   };
 
   const handleDownload = (qrId) => {
@@ -158,7 +232,7 @@ export default function QRManager() {
       const canvas = element.querySelector('canvas');
       const link = document.createElement('a');
       link.href = canvas.toDataURL('image/png');
-      const qrData = qrList.find(q => q.id === qrId);
+      const qrData = qrList.find((q) => q.id === qrId);
       link.download = `QR-${qrData.name}-${new Date().getTime()}.png`;
       link.click();
     }
@@ -171,16 +245,17 @@ export default function QRManager() {
   };
 
   const handleCancel = () => {
-    setFormData({
-      name: '',
-      url: '',
-      description: '',
-      logoFile: null,
-      logoPreview: null
-    });
+    setFormData({ name: '', url: '', description: '', logoFile: null, logoPreview: null });
     setEditingId(null);
     setError('');
   };
+
+  const statusLabel = {
+    connecting: { text: 'Đang kết nối...', color: 'text-slate-500', icon: RefreshCw, spin: true },
+    online: { text: 'Đã đồng bộ (realtime)', color: 'text-green-600', icon: Wifi, spin: false },
+    offline: { text: 'Mất kết nối Supabase', color: 'text-red-600', icon: WifiOff, spin: false },
+    not_configured: { text: 'Chưa cấu hình Supabase', color: 'text-amber-600', icon: AlertCircle, spin: false }
+  }[connectionStatus];
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-slate-50 to-slate-100">
@@ -193,21 +268,34 @@ export default function QRManager() {
           </div>
           <div className="flex flex-col items-end gap-2">
             <button
-              onClick={handleManualSync}
-              disabled={syncStatus === 'syncing'}
+              onClick={handleRefresh}
+              disabled={connectionStatus === 'connecting' || !isSupabaseConfigured}
               className="flex items-center gap-2 px-4 py-2 text-sm font-medium text-slate-600 border border-slate-200 rounded-lg hover:bg-slate-50 transition disabled:opacity-50"
             >
-              <RefreshCw className={`w-4 h-4 ${syncStatus === 'syncing' ? 'animate-spin' : ''}`} />
-              Đồng bộ Sheet
+              <RefreshCw className={`w-4 h-4 ${connectionStatus === 'connecting' ? 'animate-spin' : ''}`} />
+              Làm mới
             </button>
-            {syncStatus === 'synced' && (
-              <span className="text-xs text-green-600">✓ Đã đồng bộ</span>
+            {statusLabel && (
+              <span className={`flex items-center gap-1 text-xs ${statusLabel.color}`}>
+                <statusLabel.icon className="w-3.5 h-3.5" />
+                {statusLabel.text}
+              </span>
             )}
           </div>
         </div>
       </div>
 
       <div className="max-w-6xl mx-auto px-4 py-8">
+        {connectionStatus === 'not_configured' && (
+          <div className="mb-6 p-4 bg-amber-50 border border-amber-200 rounded-lg flex gap-3">
+            <AlertCircle className="w-5 h-5 text-amber-600 flex-shrink-0 mt-0.5" />
+            <p className="text-amber-800 text-sm">
+              Chưa kết nối Supabase. Tạo file <code className="font-mono">.env</code> từ <code className="font-mono">.env.example</code>,
+              điền <code className="font-mono">VITE_SUPABASE_URL</code> và <code className="font-mono">VITE_SUPABASE_ANON_KEY</code>, xem chi tiết trong README.md.
+            </p>
+          </div>
+        )}
+
         {/* Form Section */}
         <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-8 mb-8">
           <h2 className="text-xl font-semibold text-slate-900 mb-6">
@@ -230,7 +318,7 @@ export default function QRManager() {
                 <input
                   type="text"
                   value={formData.name}
-                  onChange={(e) => setFormData({...formData, name: e.target.value})}
+                  onChange={(e) => setFormData({ ...formData, name: e.target.value })}
                   placeholder="Ví dụ: Landing Page Năm 2026"
                   className="w-full px-4 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none transition"
                 />
@@ -243,7 +331,7 @@ export default function QRManager() {
                 <input
                   type="text"
                   value={formData.url}
-                  onChange={(e) => setFormData({...formData, url: e.target.value})}
+                  onChange={(e) => setFormData({ ...formData, url: e.target.value })}
                   placeholder="https://example.com"
                   className="w-full px-4 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none transition"
                 />
@@ -255,7 +343,7 @@ export default function QRManager() {
                 </label>
                 <textarea
                   value={formData.description}
-                  onChange={(e) => setFormData({...formData, description: e.target.value})}
+                  onChange={(e) => setFormData({ ...formData, description: e.target.value })}
                   placeholder="Ghi chú về QR code này..."
                   className="w-full px-4 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none transition resize-none"
                   rows="3"
@@ -290,7 +378,7 @@ export default function QRManager() {
                       />
                       <button
                         type="button"
-                        onClick={() => setFormData({...formData, logoFile: null, logoPreview: null})}
+                        onClick={() => setFormData({ ...formData, logoFile: null, logoPreview: null })}
                         className="text-sm text-red-600 hover:text-red-700 font-medium"
                       >
                         Xóa
@@ -323,7 +411,9 @@ export default function QRManager() {
         </div>
 
         {/* QR List Section */}
-        {qrList.length > 0 ? (
+        {loading ? (
+          <div className="text-center py-16 text-slate-500">Đang tải dữ liệu...</div>
+        ) : qrList.length > 0 ? (
           <div>
             <h2 className="text-xl font-semibold text-slate-900 mb-6">
               📋 Danh sách QR Codes ({qrList.length})
@@ -332,7 +422,7 @@ export default function QRManager() {
               {qrList.map((qr) => (
                 <div key={qr.id} className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden hover:shadow-md transition">
                   {/* QR Preview */}
-                  <div ref={el => qrRefs.current[qr.id] = el} className="p-6 bg-slate-50 border-b border-slate-200">
+                  <div ref={(el) => (qrRefs.current[qr.id] = el)} className="p-6 bg-slate-50 border-b border-slate-200">
                     <div className="flex justify-center">
                       <QRCode
                         value={qr.url}
@@ -341,14 +431,16 @@ export default function QRManager() {
                         includeMargin={true}
                         style={{ width: '200px', height: '200px' }}
                         imageSettings={
-                          qr.logoPreview ? {
-                            src: qr.logoPreview,
-                            x: undefined,
-                            y: undefined,
-                            height: 160,
-                            width: 160,
-                            excavate: true
-                          } : undefined
+                          qr.logoPreview
+                            ? {
+                                src: qr.logoPreview,
+                                x: undefined,
+                                y: undefined,
+                                height: 160,
+                                width: 160,
+                                excavate: true
+                              }
+                            : undefined
                         }
                       />
                     </div>
@@ -357,7 +449,7 @@ export default function QRManager() {
                   {/* Details */}
                   <div className="p-6">
                     <h3 className="font-semibold text-slate-900 mb-2 truncate">{qr.name}</h3>
-                    
+
                     {qr.description && (
                       <p className="text-sm text-slate-600 mb-3 line-clamp-2">{qr.description}</p>
                     )}
@@ -423,7 +515,6 @@ export default function QRManager() {
           </div>
         )}
       </div>
-
     </div>
   );
 }
